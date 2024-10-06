@@ -18,7 +18,6 @@
 */
 
 const { Client, GatewayIntentBits, GuildMember, Intents, Guild } = require('discord.js');
-const { Player, QueryType, useMainPlayer, useQueue, entersState, GuildQueuePlayerNode, usePlayer } = require('discord-player');
 const prism = require('prism-media');
 const { createAudioPlayer, createAudioResource, StreamType,
     demuxProbe, joinVoiceChannel, NoSubscriberBehavior,
@@ -29,24 +28,15 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const sdk = require("microsoft-cognitiveservices-speech-sdk");
 const { soundBoard } = require('./soundboard');
-const SpotifyWebApi = require('spotify-web-api-node');
-const { YoutubeiExtractor } = require("discord-player-youtubei")
 
 
 
 class AudioBot {
 
-    constructor(token, speechKey, speechRegion,
-        SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, YOUTUBE_API_KEY) {
+    constructor(token, speechKey, speechRegion) {
         this.token = token;
         this.speechKey = speechKey;
         this.speechRegion = speechRegion;
-        this.spotifyApi = new SpotifyWebApi({
-            clientId: SPOTIFY_CLIENT_ID,
-            clientSecret: SPOTIFY_CLIENT_SECRET,
-        });
-        this.youtubeApiKey = YOUTUBE_API_KEY;
-
         // Create a new Discord client, with only the necessary intents enabled
         this.client = new Client({
             intents: [
@@ -62,64 +52,65 @@ class AudioBot {
             console.error('Failed to login to Discord:', error);
         });
 
-        this.player = new Player(this.client);
-        this.player.extractors.register(YoutubeiExtractor, {});
-
-        this.queue = new Map(); // Map of queues for each guild
-
         this.isRecording = false;
-        this.isPlaying = false;
-        this.ffmpegProcess = null;
-        this.outputStream = null;
         this.audioStreams = new Map(); // Map of audio streams for each user
         this.currentConnection = null;
 
-        this.player.on('error', (queue, error) => {
-            console.error(`Player error: ${error.message}`);
-            queue.metadata.channel.send(`An error occurred: ${error.message}`);
-        });
-
-        this.player.on('playerError', (queue, error) => {
-            console.error(`Player error: ${error.message}`);
-            queue.metadata.channel.send(`A player error occurred: ${error.message}`);
-        });
-
         console.log('Bot initialized and ready to handle commands.');
-
-
         this.voiceChannel = null;
     }
 
+    async ensureConnection(interaction) {
+        try {
+            this.voiceChannel = interaction.member.voice.channel;
+
+            if (!this.voiceChannel) {
+                await interaction.followUp('You need to join a voice channel first!');
+                return false;
+            }
+
+            // If connected to a different channel, disconnect
+            if (this.currentConnection && this.currentConnection.joinConfig.channelId !== this.voiceChannel.id) {
+                this.currentConnection.destroy();
+                this.currentConnection = null;
+            }
+
+            // Join the voice channel if not connected
+            if (!this.currentConnection) {
+                this.currentConnection = joinVoiceChannel({
+                    channelId: this.voiceChannel.id,
+                    guildId: this.voiceChannel.guild.id,
+                    adapterCreator: this.voiceChannel.guild.voiceAdapterCreator,
+                });
+                console.log('Joined voice channel:', this.voiceChannel.name);
+            }
+
+            return true;
+        } catch (error) {
+            console.error(`Error ensuring connection: ${error.message}`);
+            await interaction.followUp('There was an error connecting to the voice channel.');
+            return false;
+        }
+    }
 
     async joinCommand(interaction) {
-        this.voiceChannel = interaction.member.voice.channel;
+        if (!await this.ensureConnection(interaction)) return;
 
-        if (!this.voiceChannel) {
-            await interaction.reply('You need to join a voice channel first!');
-            return;
-        }
+        // Play a sound after joining the voice channel
+        const player = createAudioPlayer();
+        const resource = createAudioResource("../audio_files/newt.mp3");
+        player.play(resource);
+        this.currentConnection.subscribe(player);
 
-        // Check if already connected to the same voice channel
-        if (this.currentConnection && this.currentConnection.joinConfig.channelId === this.voiceChannel.id) {
-            await interaction.reply('Already connected to this voice channel!');
-            return;
-        }
-
-        // If connected to a different channel, disconnect
-        if (this.currentConnection) {
-            this.currentConnection.destroy();
-        }
-
-        // Join the voice channel
-        this.currentConnection = joinVoiceChannel({
-            channelId: this.voiceChannel.id,
-            guildId: this.voiceChannel.guild.id,
-            adapterCreator: this.voiceChannel.guild.voiceAdapterCreator,
+        player.on('idle', async () => {
+            await interaction.followUp('Joined the voice channel and played a sound.');
+            player.stop();
+            console.log('Player stopped after playing sound.');
         });
 
-        console.log('Joined voice channel:', this.voiceChannel.name);
-
-        this.utilizeSoundBoard(null, true, null);
+        player.on('error', (error) => {
+            console.error(`Error: ${error.message}`);
+        });
 
         await interaction.reply('Joined the voice channel.');
     }
@@ -129,12 +120,6 @@ class AudioBot {
             await interaction.reply('Already recording!');
             return;
         }
-
-        if (this.isPlaying) {
-            await interaction.reply('Cannot record while music is playing.');
-            return;
-        }
-
         if (this.currentConnection) {
             this.startRecording(this.currentConnection, interaction.channel);
             await interaction.reply('Started recording.');
@@ -160,30 +145,12 @@ class AudioBot {
 
         // Check if the bot is already in the voice channel
         if (!this.currentConnection) {
+            console.log('Connection not found in the bot instance.: ', this.currentConnection);
             console.log('I am not in a voice channel!');
+            return;
         }
 
         console.log('I am in a voice channel!');
-
-        // Check if music is playing
-        if (this.isPlaying) {
-            console.log('Music is playing!');
-            console.log('Attempting to Stop the music!');
-
-            const queue = useQueue(interaction.guild.id);
-
-            let currentPlayer = new GuildQueuePlayerNode(queue);
-
-            currentPlayer.stop();
-
-            console.log('Connection:', this.currentConnection);
-
-            console.log('Broke?');
-
-            this.isPlaying = false;
-
-            await interaction.followUp('Stopped the music!');
-        }
 
         // Create audio player and play goodbye sound
         const player = createAudioPlayer();
@@ -210,14 +177,13 @@ class AudioBot {
             }
 
             // Send follow-up message
-            await interaction.followUp('Left the voice channel and stopped recording.');
+            await interaction.followUp('Left the voice channel, and deleted messages.');
         });
 
         player.on('error', (error) => {
             console.error(`Error: ${error.message}`);
         });
     }
-
 
     async stopRecordingCommand(interaction) {
         console.log('Stopping recording before playing music');
@@ -227,186 +193,7 @@ class AudioBot {
         if (!interaction.replied) {
             await interaction.reply('Stopped recording.');
         }
-
-        this.isPlaying = false;
         this.isRecording = false;
-    }
-
-    async playCommand(interaction) {
-
-        this.isPlaying = true;
-
-        // check if the bot is already in the voice channel
-        if (!this.currentConnection) {
-            console.log('I am not in a voice channel!');
-            try {
-
-                this.voiceChannel = interaction.member.voice.channel;
-
-                // If connected to a different channel, disconnect
-                if (this.currentConnection) {
-                    this.currentConnection.destroy();
-                }
-
-                console.log('Voice Channel:', this.voiceChannel.name);
-
-
-                console.log("Trying to play the song: " + interaction.options.getString('song_url', true));
-
-                // Ensure we defer only if not already deferred
-                if (!interaction.deferred && !interaction.replied) {
-                    await interaction.deferReply();
-                }
-
-                const query = interaction.options.getString('song_url', true);
-
-                // Stop recording if active
-                if (this.isRecording) {
-                    await this.stopRecording();
-                }
-
-                console.log("Playing the song");
-
-                // Proceed with playing the song
-                const { track } = await this.player.play(this.voiceChannel, query, {
-                    nodeOptions: { metadata: interaction }
-                });
-
-                if (!interaction.replied) {
-                    await interaction.followUp(`**${track.cleanTitle}** enqueued!`);
-                }
-
-            } catch (e) {
-                console.error(`Error playing music: ${e.message}`);
-
-                if (!interaction.replied && !interaction.deferred) {
-                    await interaction.reply(`Something went wrong: ${e.message}`);
-                }
-            }
-        }
-
-        try {
-            if (!this.voiceChannel) {
-                await interaction.reply('You need to join a voice channel first!');
-                return;
-            }
-
-            // Check if already connected to the same voice channel
-            if (this.currentConnection && this.currentConnection.joinConfig.channelId === this.voiceChannel.id) {
-                await interaction.reply('Already connected to this voice channel!');
-                console.log('Already connected to this voice channel:', this.voiceChannel.name);
-
-                // Since we are already connected, proceed to play the song
-                try {
-
-                    console.log("Trying to play the song: " + interaction.options.getString('song_url', true));
-
-                    // Ensure we defer only if not already deferred
-                    if (!interaction.deferred && !interaction.replied) {
-                        await interaction.deferReply();
-                    }
-
-                    const query = interaction.options.getString('song_url', true);
-
-                    // Stop recording if active
-                    if (this.isRecording) {
-                        await this.stopRecording();
-                    }
-
-                    console.log("Playing the song");
-
-                    // Proceed with playing the song
-                    const { track } = await this.player.play(this.voiceChannel, query, {
-                        nodeOptions: { metadata: interaction }
-                    });
-
-
-                    await interaction.followUp(`**${track.cleanTitle}** enqueued!`);
-
-
-                } catch (e) {
-                    console.error(`Error playing music: ${e.message}`);
-
-                    if (!interaction.replied && !interaction.deferred) {
-                        await interaction.reply(`Something went wrong: ${e.message}`);
-                    }
-                }
-
-                return;
-            }
-
-            this.voiceChannel = interaction.member.voice.channel;
-
-            // If connected to a different channel, disconnect
-            if (this.currentConnection) {
-                this.currentConnection.destroy();
-            }
-
-            console.log('Voice Channel:', this.voiceChannel.name);
-
-            // Ensure we defer only if not already deferred
-            if (!interaction.deferred && !interaction.replied) {
-                await interaction.deferReply();
-            }
-
-            const query = interaction.options.getString('song_url', true);
-
-            // Stop recording if active
-            if (this.isRecording) {
-                await this.stopRecording();
-            }
-
-            // Proceed with playing the song
-            const { track } = await this.player.play(this.voiceChannel, query, {
-                nodeOptions: { metadata: interaction }
-            });
-
-            if (!interaction.replied) {
-                await interaction.followUp(`**${track.cleanTitle}** enqueued!`);
-            }
-
-        } catch (e) {
-            console.error(`Error playing music: ${e.message}`);
-
-            if (!interaction.replied && !interaction.deferred) {
-                await interaction.reply(`Something went wrong: ${e.message}`);
-            }
-        }
-    }
-
-
-    async skipCommand(interaction) {
-        const queue = useQueue(interaction.guild.id);
-        const client = interaction.client;  // Use client directly from interaction
-
-        if (!queue) return interaction.reply({ content: `${client.dev.error} | I am **not** in a voice channel`, ephemeral: true });
-        if (!queue.currentTrack)
-            return interaction.reply({ content: `${client.dev.error} | There is no track **currently** playing`, ephemeral: true });
-
-        queue.node.skip();
-        return interaction.reply({
-            content: `⏩ | I have skipped to the next track`
-        });
-    }
-
-    async stopCommand(interaction) {
-        const queue = useQueue(interaction.guild.id);
-        const client = interaction.client;  // Use client directly from interaction
-
-        if (!queue) return interaction.reply({ content: `${client.dev.error} | I am **not** in a voice channel`, ephemeral: true });
-        if (!queue.currentTrack)
-            return interaction.reply({ content: `${client.dev.error} | There is no track **currently** playing`, ephemeral: true });
-
-        queue.tracks.clear();
-        queue.node.stop();
-
-
-        // kill the current connection and start a new one
-        this.currentConnection.destroy();
-        this.currentConnection = null;
-        return interaction.reply({
-            content: `⏹ | I have stopped the music`
-        });
     }
 
     async syncCommands() {
@@ -439,26 +226,6 @@ class AudioBot {
                 description: 'Start recording audio',
             },
             {
-                name: 'play',
-                description: 'Play a song',
-                options: [
-                    {
-                        name: 'song_url',
-                        description: 'Name of the song to play',
-                        type: 3,
-                        required: true,
-                    },
-                ],
-            },
-            {
-                name: 'skip',
-                description: 'Skip the current song',
-            },
-            {
-                name: 'stop',
-                description: 'Stop the music',
-            },
-            {
                 name: 'stop_recording',
                 description: 'Stop recording audio',
             }
@@ -468,11 +235,11 @@ class AudioBot {
             console.log('Clearing commands...');
 
             const existingCommands = await guild.commands.fetch();
-            if (existingCommands.size > 7) {
+            if (existingCommands.size > 4) {
                 await guild.commands.set([]); // Clear existing commands
                 console.log('Commands cleared!');
             } else {
-                console.log('Less than 7 commands, no need to clear.');
+                console.log('Less than 4 commands, no need to clear.');
             }
 
             console.log('Attempting to register commands...');
@@ -491,9 +258,6 @@ class AudioBot {
             join: this.joinCommand.bind(this),
             leave: this.leaveCommand.bind(this),
             record: this.recordCommand.bind(this),
-            play: this.playCommand.bind(this),
-            skip: this.skipCommand.bind(this),
-            stop: this.stopCommand.bind(this),
             stop_recording: this.stopRecordingCommand.bind(this),
         };
 
@@ -728,7 +492,6 @@ class AudioBot {
 
         });
     }
-
 
     playSoundForAction(action) {
         const soundFiles = {

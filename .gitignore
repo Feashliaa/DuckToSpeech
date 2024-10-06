@@ -1,3 +1,4 @@
 .env
 audio_files/
 node_modules/
+javascript_files/soundboard.js
